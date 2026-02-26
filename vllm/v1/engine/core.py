@@ -340,6 +340,15 @@ class EngineCore:
         """
         self._scheduler_paused = False
 
+    def get_request_counts(self) -> tuple[int, int]:
+        """Return (num_running, num_waiting) request counts.
+
+        Used by the /debug/batch_info endpoint to detect when all
+        requests have finished prefill and entered decode (i.e.,
+        num_waiting == 0).
+        """
+        return self.scheduler.get_request_counts()
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""

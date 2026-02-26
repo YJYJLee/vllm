@@ -34,6 +34,23 @@ async def debug_wake_up(request: Request):
     return JSONResponse(content={"status": "awake"})
 
 
+@router.get("/batch_info")
+async def debug_batch_info(request: Request):
+    """Return current scheduler batch composition.
+
+    Used by vllm bench iterations to detect when all requests have
+    finished prefill and entered decode (num_waiting == 0), so that
+    profiling captures only steady-state decode iterations.
+    """
+    client = engine_client(request)
+    num_running, num_waiting = await client.engine_core.call_utility_async(
+        "get_request_counts")
+    return JSONResponse(content={
+        "num_running": num_running,
+        "num_waiting": num_waiting,
+    })
+
+
 @router.post("/profile/start")
 async def debug_profile_start(request: Request, prefix: str = "benchmark",
                               delay: int = 0):

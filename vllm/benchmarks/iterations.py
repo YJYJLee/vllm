@@ -327,6 +327,57 @@ async def run_prefix_cache_warmup(
     )
 
 
+async def wait_for_batch_ready(
+    session: aiohttp.ClientSession,
+    rotator: EndpointRotator,
+    target_running: int,
+    timeout_s: float = 120.0,
+    poll_interval_s: float = 0.1,
+) -> bool:
+    """Poll /debug/batch_info until all requests are running (in decode).
+
+    On TPU, new requests must each go through a mandatory prefill step
+    even with prefix cache hits.  With max_num_batched_tokens limiting
+    how many can prefill per step, the batch ramps up incrementally
+    (e.g. 8 -> 16 -> 32 -> 64).  This function waits for the ramp-up
+    to finish so that profiling captures only steady-state decode.
+
+    Returns True if the target was reached, False on timeout.
+    """
+    endpoint = rotator.all()[0]
+    deadline = time.perf_counter() + timeout_s
+
+    while time.perf_counter() < deadline:
+        try:
+            resp = await session.get(f"{endpoint}/debug/batch_info")
+            if resp.status == 200:
+                info = await resp.json()
+                num_running = info.get("num_running", 0)
+                num_waiting = info.get("num_waiting", -1)
+                if num_waiting == 0 and num_running >= target_running:
+                    logger.info(
+                        "Batch ready: %d running, %d waiting",
+                        num_running, num_waiting,
+                    )
+                    return True
+            elif resp.status == 404:
+                # Server doesn't have /debug/batch_info — skip polling
+                logger.info(
+                    "Server does not support /debug/batch_info, "
+                    "skipping batch readiness wait"
+                )
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(poll_interval_s)
+
+    logger.warning(
+        "Timeout waiting for batch to reach %d running requests",
+        target_running,
+    )
+    return False
+
+
 async def run_single_iteration(
     session: aiohttp.ClientSession,
     config: BenchmarkConfig,
@@ -334,12 +385,20 @@ async def run_single_iteration(
     benchmark_prompt: str,
     batch_size: int,
     num_tokens_to_generate: int = 0,
-) -> tuple[float, int, int]:
+    trace_prefix: str | None = None,
+) -> tuple[float, int, int, bool]:
     """Run one iteration: sleep -> queue requests -> wake -> measure.
+
+    For decode mode with profiling, waits for the batch to fully ramp up
+    before starting the profiler so the trace captures only steady-state
+    decode iterations.
 
     All requests use non-streaming mode for robustness. Streaming was
     previously used for TPU warmup token exclusion but caused
     ServerDisconnectedError on large batch+context combinations.
+
+    Returns:
+        (elapsed_ms, prompt_tokens, completion_tokens, trace_started)
     """
 
     # 1. Pause scheduling on ALL endpoints
@@ -370,10 +429,34 @@ async def run_single_iteration(
     # 3. Resume scheduling on ALL endpoints and time the batch
     start = time.perf_counter()
     await call_debug_endpoint(session, rotator, "/debug/wake_up")
+
+    # 4. For decode mode with profiling: wait for all requests to finish
+    #    prefill and enter decode before starting the profiler.
+    #    On TPU, new requests must each go through a mandatory prefill
+    #    step even with prefix cache hits, and max_num_batched_tokens
+    #    limits how many can prefill per step.  This causes the batch
+    #    to ramp up incrementally (e.g. 8 -> 16 -> 32 -> 64).
+    trace_started = False
+    if config.mode == "decode" and trace_prefix is not None:
+        await wait_for_batch_ready(session, rotator, batch_size)
+        # Now all requests are in decode — start profiling
+        params = {"prefix": trace_prefix, "delay": 0}
+        for attempt in range(3):
+            trace_started = await call_debug_endpoint(
+                session, rotator, "/debug/profile/start", params,
+            )
+            if trace_started:
+                break
+            logger.warning(
+                "Failed to start profiling for %s (attempt %d/3)",
+                trace_prefix, attempt + 1,
+            )
+            await asyncio.sleep(2.0)
+
     responses = await asyncio.gather(*tasks)
     elapsed_ms = (time.perf_counter() - start) * 1000
 
-    # 4. Count tokens
+    # 5. Count tokens
     total_prompt_tokens = 0
     total_completion_tokens = 0
     for resp in responses:
@@ -385,7 +468,7 @@ async def run_single_iteration(
         except Exception as e:
             logger.warning("Failed to parse response: %s", e)
 
-    return elapsed_ms, total_prompt_tokens, total_completion_tokens
+    return elapsed_ms, total_prompt_tokens, total_completion_tokens, trace_started
 
 
 async def fetch_traces(
@@ -509,20 +592,18 @@ async def run_benchmark(
                 session, rotator, config.model, context_prompt, global_batch_size
             )
 
-            # Start profiling
-            # For decode mode, use delay=1 to skip the prefill step in both
-            # the trace AND timing. The server defers jax.profiler.start_trace()
-            # by 1 engine step so only decode iterations are captured.
+            # Build trace prefix for this param combo
             trace_prefix = None
             trace_started = False
-            profile_delay = 1 if config.mode == "decode" else 0
             if config.profile:
                 trace_prefix = (
                     f"{config.mode}_ctx{ctx_len}_in{in_len}_bs{batch_size_per_dp}"
                 )
-                params = {"prefix": trace_prefix, "delay": profile_delay}
-                # Retry profile/start with backoff — large batch warmup passes
-                # can saturate the server's connection queue, dropping requests
+
+            # For prefill mode, start profiling BEFORE the iteration
+            # (the entire prefill is what we want to capture).
+            if config.profile and config.mode == "prefill" and trace_prefix:
+                params = {"prefix": trace_prefix, "delay": 0}
                 for attempt in range(3):
                     trace_started = await call_debug_endpoint(
                         session, rotator, "/debug/profile/start",
@@ -541,6 +622,7 @@ async def run_benchmark(
                 elapsed_ms,
                 prompt_tokens,
                 completion_tokens,
+                decode_trace_started,
             ) = await run_single_iteration(
                 session,
                 config,
@@ -548,7 +630,14 @@ async def run_benchmark(
                 benchmark_prompt,
                 global_batch_size,
                 num_tokens_to_generate,
+                trace_prefix=trace_prefix if config.mode == "decode" else None,
             )
+
+            # For decode mode, trace_started comes from run_single_iteration
+            # (profiling starts after batch ramp-up inside that function).
+            if config.mode == "decode" and decode_trace_started:
+                trace_started = True
+                trace_prefixes.append(trace_prefix)
 
             # Stop profiling only if start succeeded
             # Read server-reported decode-only elapsed_ms from response
